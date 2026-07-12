@@ -853,6 +853,10 @@ def content_hash(skill_path: Path) -> str:
     produce the same digest for the same skill (one operates on disk,
     one on an in-memory bundle), so any change to the hash shape MUST
     land in both places at once.
+
+    The relative paths are sorted as POSIX strings so the iteration order
+    is identical on every OS and filesystem: two skills with byte-identical
+    contents hash the same regardless of where the files live on disk.
     """
     return f"sha256:{_content_digest(skill_path)[:16]}"
 
