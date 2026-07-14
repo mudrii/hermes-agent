@@ -658,6 +658,31 @@ class TestResolveWithRefresh:
 
 
 class TestRunOauthSetupToken:
+    # Concrete CompletedProcess fixtures for the two subprocesses the
+    # production code invokes under ``run_oauth_setup_token``:
+    #
+    #   1. ``[claude_path, "setup-token"]``  — interactive login (argv[0]
+    #      varies by platform but is never literally ``"security"``).
+    #   2. ``["security", "find-generic-password", ...]`` — macOS keychain
+    #      probe inside ``read_claude_code_credentials``. We don't seed the
+    #      keychain in unit tests, so it returns a non-zero exit and an
+    #      empty stdout — the production code interprets that as "no entry
+    #      found" and falls through.
+    #
+    # Mocking at the owning seam (``agent.anthropic_adapter.subprocess.run``
+    # rather than the global ``subprocess.run``) keeps the mock scoped to
+    # the adapter so it cannot collide with sibling modules or with xdist
+    # workers shimming ``subprocess.run`` for their own reasons.
+    @staticmethod
+    def _setup_token_subprocess_side_effect(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args", [])
+        first = argv[0] if argv else ""
+        if first == "security":
+            # macOS keychain probe: no entry seeded in the test → returncode != 0.
+            return MagicMock(returncode=44, stdout="", stderr="")
+        # ``claude setup-token``: interactive, exit success, no captured output.
+        return MagicMock(returncode=0, stdout="", stderr="")
+
     def test_raises_when_claude_not_installed(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda _: None)
         with pytest.raises(FileNotFoundError, match="claude.*CLI.*not installed"):
@@ -681,8 +706,10 @@ class TestRunOauthSetupToken:
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "agent.anthropic_adapter.subprocess.run",
+            side_effect=self._setup_token_subprocess_side_effect,
+        ) as mock_run:
             token = run_oauth_setup_token()
 
         assert token == "from-cred-file"
@@ -699,8 +726,10 @@ class TestRunOauthSetupToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "agent.anthropic_adapter.subprocess.run",
+            side_effect=self._setup_token_subprocess_side_effect,
+        ):
             token = run_oauth_setup_token()
 
         assert token == "from-env-var"
@@ -712,8 +741,10 @@ class TestRunOauthSetupToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch(
+            "agent.anthropic_adapter.subprocess.run",
+            side_effect=self._setup_token_subprocess_side_effect,
+        ):
             token = run_oauth_setup_token()
 
         assert token is None
@@ -722,7 +753,10 @@ class TestRunOauthSetupToken:
         """Returns None gracefully when user interrupts the flow."""
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
 
-        with patch("subprocess.run", side_effect=KeyboardInterrupt):
+        with patch(
+            "agent.anthropic_adapter.subprocess.run",
+            side_effect=KeyboardInterrupt,
+        ):
             token = run_oauth_setup_token()
 
         assert token is None
