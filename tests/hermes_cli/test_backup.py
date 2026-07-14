@@ -3,6 +3,8 @@
 import json
 import os
 import sqlite3
+import stat
+import sys
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -193,6 +195,108 @@ class TestShouldExclude:
 # ---------------------------------------------------------------------------
 
 class TestBackup:
+    def test_secure_writer_without_fchmod_remains_portable(self, tmp_path, monkeypatch):
+        """Windows lacks os.fchmod; backup creation must still succeed."""
+        from hermes_cli.backup import _secure_zip_writer
+
+        monkeypatch.delattr(os, "fchmod", raising=False)
+        out_zip = tmp_path / "portable.zip"
+        with _secure_zip_writer(out_zip) as zf:
+            zf.writestr("probe.txt", "ok")
+
+        with zipfile.ZipFile(out_zip) as zf:
+            assert zf.read("probe.txt") == b"ok"
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
+    def test_secure_writer_sets_owner_only_mode_on_staging_file(self, tmp_path, monkeypatch):
+        """The staging file must already be 0o600 *before* it is renamed
+        into place. ``os.replace`` preserves the source's mode bits, so the
+        final archive inherits the same permissions without a post-replace
+        chmod — and there is no window where the archive is world-readable.
+        """
+        from hermes_cli.backup import _secure_zip_writer
+
+        out_zip = tmp_path / "prereplace.zip"
+
+        # Intercept ``os.replace`` so we can record exactly which staging
+        # file the writer was about to rename, then forward to the real call.
+        staging_paths: list = []
+        real_replace = os.replace
+
+        def capture_replace(src, dst):
+            staging_paths.append(Path(src))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", capture_replace)
+
+        with _secure_zip_writer(out_zip) as zf:
+            zf.writestr("probe.txt", "ok")
+            # While the writer is open, the staging temp file already exists
+            # on disk and its mode bits must be 0o600 — proving the permissions
+            # are set *before* the atomic rename. We locate the temp via the
+            # well-defined prefix/suffix pattern the writer uses.
+            tmp_candidates = list(out_zip.parent.glob(f".{out_zip.name}.*.tmp"))
+            assert len(tmp_candidates) == 1, (
+                f"expected exactly one staging tmp, got {tmp_candidates}"
+            )
+            assert stat.S_IMODE(tmp_candidates[0].stat().st_mode) == 0o600
+
+        assert staging_paths, "expected the writer to call os.replace exactly once"
+        # After replace the staging file must be gone — otherwise a stale
+        # temp with potentially permissive bits would linger on disk.
+        for staging in staging_paths:
+            assert not staging.exists()
+        assert stat.S_IMODE(out_zip.stat().st_mode) == 0o600
+
+    def test_secure_writer_cleans_up_fd_and_tmp_on_failure(self, tmp_path, monkeypatch):
+        """When writing raises mid-flight the writer must:
+          1. Close the file descriptor (no FD leak to /dev/null from mkstemp).
+          2. Unlink the staging temp so partial archives do not accumulate.
+          3. Re-raise the original exception so callers see the failure.
+        """
+        from hermes_cli import backup as backup_mod
+        from hermes_cli.backup import _secure_zip_writer
+
+        out_zip = tmp_path / "aborted.zip"
+
+        class _BoomZip:
+            def __init__(self, fileobj, *args, **kwargs):
+                raise RuntimeError("simulated zipfile failure")
+
+            def __getattr__(self, name):  # pragma: no cover - safety net
+                raise RuntimeError("simulated zipfile failure")
+
+        # Snapshot how many fds the process holds via /dev/fd before/after.
+        # On macOS /dev/fd exists; skip otherwise.
+        before = set()
+        after = set()
+        if sys.platform != "win":
+            try:
+                before = set(os.listdir("/dev/fd"))
+            except OSError:
+                pass
+
+        monkeypatch.setattr(backup_mod.zipfile, "ZipFile", _BoomZip)
+
+        with pytest.raises(RuntimeError, match="simulated zipfile failure"):
+            with _secure_zip_writer(out_zip):
+                pass  # zipfile.ZipFile raises during __init__, before any write
+
+        # Staging temp should be gone; final path must not exist.
+        leftovers = list(tmp_path.glob(f".{out_zip.name}.*.tmp"))
+        assert leftovers == [], f"staging tmp leaked: {leftovers}"
+        assert not out_zip.exists()
+
+        if before:
+            try:
+                after = set(os.listdir("/dev/fd"))
+            except OSError:
+                pass
+            # No new fds remain open (allow unrelated fd churn from the test
+            # runner by intersecting with our pre-snapshot).
+            leaked = (after - before) - {"0", "1", "2"}
+            assert not leaked, f"file descriptor leak detected: {sorted(leaked)}"
+
     def test_creates_zip(self, tmp_path, monkeypatch):
         """Backup creates a valid zip containing expected files."""
         hermes_home = tmp_path / ".hermes"
@@ -285,6 +389,9 @@ class TestBackup:
         assert "Backup incomplete" in output
         assert "state.db: SQLite safe copy failed" in output
         assert "Restore with:" not in output
+
+        if not sys.platform.startswith("win"):
+            assert stat.S_IMODE(out_zip.stat().st_mode) == 0o600
 
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):
         """SQLite staging temp files must be created on the output zip's
@@ -2025,6 +2132,9 @@ class TestPreUpdateBackup:
         assert out.parent == hermes_home / "backups"
         assert out.name.startswith("pre-update-")
         assert out.suffix == ".zip"
+        if not sys.platform.startswith("win"):
+            assert stat.S_IMODE(out.parent.stat().st_mode) == 0o700
+            assert stat.S_IMODE(out.stat().st_mode) == 0o600
 
     def test_backup_contents_match_full_backup(self, hermes_home):
         """Pre-update backup should include the same user data that

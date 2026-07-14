@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +25,52 @@ from typing import Any, Dict, List, Optional
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _secure_zip_writer(out_path: Path):
+    """Atomically create an owner-only zip, independent of process umask.
+
+    Permissions are established on the staging file *before* it is renamed
+    into place. ``os.replace`` preserves the source file's mode bits, so the
+    final archive is already 0o600 the moment ``out_path`` appears; no
+    post-replace ``chmod`` is needed (and would race a concurrent reader).
+    On Windows ``os.fchmod`` is missing, but ``tempfile.mkstemp`` already
+    opens the file exclusively, so we tighten by path as a fallback.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.", suffix=".tmp", dir=str(out_path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    # ``fdopen`` takes ownership of ``fd`` on success. Until that happens
+    # (or if it fails) we own the descriptor and must close it ourselves.
+    raw = None
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # Windows has no os.fchmod; mkstemp is exclusive, then tighten by path.
+            os.chmod(tmp_path, 0o600)
+        raw = os.fdopen(fd, "w+b")
+        # From here on, ``raw`` owns ``fd`` and is responsible for closing it.
+        with zipfile.ZipFile(raw, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            yield zf
+        raw.flush()
+        os.fsync(raw.fileno())
+        # ``os.replace`` atomically swaps ``tmp_path`` onto ``out_path`` and
+        # preserves the source's mode bits, so 0o600 set above carries over.
+        os.replace(tmp_path, out_path)
+    except Exception:
+        # Close ``fd`` only if fdopen never took ownership of it. Once
+        # ``raw`` exists, closing ``raw`` already closes ``fd``; double-closing
+        # would raise EBADF, which we swallow to keep the error path quiet.
+        if raw is None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +435,7 @@ def run_backup(args) -> None:
     errors = []
     t0 = time.monotonic()
 
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    with _secure_zip_writer(out_path) as zf:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
                 # Safe copy for SQLite databases (handles WAL mode)
@@ -1233,7 +1280,7 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
 
     sqlite_snapshot_failed = False
     try:
-        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        with _secure_zip_writer(out_path) as zf:
             for abs_path, rel_path in files_to_add:
                 try:
                     if abs_path.suffix == ".db":
@@ -1351,7 +1398,8 @@ def create_pre_update_backup(
 
     backup_dir = _pre_update_backup_dir(hermes_root)
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(backup_dir, 0o700)
     except OSError as exc:
         logger.warning("Could not create pre-update backup dir %s: %s", backup_dir, exc)
         return None
@@ -1428,7 +1476,8 @@ def create_pre_migration_backup(
     # update-backup listing pick up pre-migration archives too.
     backup_dir = _pre_update_backup_dir(hermes_root)
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(backup_dir, 0o700)
     except OSError as exc:
         logger.warning("Could not create pre-migration backup dir %s: %s", backup_dir, exc)
         return None

@@ -9,6 +9,8 @@ subcommand dispatch.
 
 import json
 import os
+import stat
+import sys
 import tempfile
 import shutil
 
@@ -235,6 +237,106 @@ def test_pending_store_roundtrip(hermes_home):
     assert wa.discard_pending("memory", rec["id"]) is True
     assert wa.pending_count("memory") == 0
     assert wa.get_pending("memory", rec["id"]) is None
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
+def test_pending_store_uses_owner_only_permissions(hermes_home):
+    from pathlib import Path
+    from tools import write_approval as wa
+
+    rec = wa.stage_write(
+        "skills", {"action": "create", "name": "private"},
+        summary="private proposal", origin="background_review",
+    )
+    root = Path(hermes_home) / "pending"
+    record = root / "skills" / f"{rec['id']}.json"
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(record.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(record.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
+def test_pending_store_preserves_group_shared_home(hermes_home):
+    from pathlib import Path
+    from tools import write_approval as wa
+
+    home = Path(hermes_home)
+    home.chmod(0o770)
+    rec = wa.stage_write(
+        "skills", {"action": "create", "name": "shared"},
+        summary="shared proposal", origin="background_review",
+    )
+    root = home / "pending"
+    record = root / "skills" / f"{rec['id']}.json"
+
+    assert stat.S_IMODE(root.stat().st_mode) & 0o070 == 0o070
+    assert stat.S_IMODE(record.parent.stat().st_mode) & 0o070 == 0o070
+    assert stat.S_IMODE(record.stat().st_mode) == 0o660
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
+def test_pending_store_sets_owner_only_mode_on_staging_file(hermes_home, monkeypatch):
+    """The ``stage_write`` staging file must already carry 0o600 mode bits
+    *before* ``os.replace`` renames it onto the final path. We capture the
+    staging path by intercepting ``os.replace`` and assert on the file's
+    permission bits while the writer still owns it.
+    """
+    from pathlib import Path
+    from tools import write_approval as wa
+
+    home = Path(hermes_home)
+    staging_paths: list = []
+    real_replace = os.replace
+
+    def capture_replace(src, dst):
+        staging_paths.append(Path(src))
+        # Assert mode bits *at the moment of replace*: by then the writer
+        # has set the desired permissions on the staging file, so the
+        # caller can never observe a world-readable record mid-rename.
+        assert stat.S_IMODE(Path(src).stat().st_mode) == 0o600
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", capture_replace)
+
+    rec = wa.stage_write(
+        "skills", {"action": "create", "name": "precheck"},
+        summary="precheck", origin="foreground",
+    )
+
+    assert staging_paths, "stage_write never called os.replace"
+    # After replace the staging file must not linger.
+    for staging in staging_paths:
+        assert not staging.exists()
+    final_record = home / "pending" / "skills" / f"{rec['id']}.json"
+    assert stat.S_IMODE(final_record.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
+def test_pending_store_cleans_up_staging_on_failure(hermes_home, monkeypatch):
+    """If ``os.fsync`` or any post-open step raises, the staging tmp file
+    must be unlinked so we never leave a half-written world-readable
+    pending record on disk.
+    """
+    from pathlib import Path
+    from tools import write_approval as wa
+
+    def boom_fsync(fd):
+        raise RuntimeError("simulated fsync failure")
+
+    monkeypatch.setattr(os, "fsync", boom_fsync)
+
+    # ``stage_write`` swallows exceptions and returns a record (best-effort
+    # semantics); the *important* contract for this test is that no
+    # staging tmp is left behind and no final record appears.
+    rec = wa.stage_write(
+        "skills", {"action": "create", "name": "fail"},
+        summary="fail", origin="foreground",
+    )
+    record = Path(hermes_home) / "pending" / "skills" / f"{rec['id']}.json"
+    leftovers = list((Path(hermes_home) / "pending" / "skills").glob("*.tmp"))
+    assert leftovers == [], f"staging tmp leaked: {leftovers}"
+    assert not record.exists()
 
 
 # ---------------------------------------------------------------------------
