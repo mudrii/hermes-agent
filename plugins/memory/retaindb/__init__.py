@@ -36,6 +36,7 @@ from urllib.parse import quote
 from agent.memory_provider import MemoryProvider
 from agent.secret_scope import get_secret
 from agent.file_safety import raise_if_read_blocked
+from hermes_cli.private_files import connect_private_sqlite, ensure_private_directory
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -361,7 +362,7 @@ class _WriteQueue:
         self._db_path = db_path
         self._q: queue.Queue = queue.Queue()
         self._thread = threading.Thread(target=self._loop, name="retaindb-writer", daemon=True)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self._db_path.parent)
         # Thread-local connection cache — one connection per thread, reused.
         self._local = threading.local()
         self._init_db()
@@ -374,7 +375,9 @@ class _WriteQueue:
         """Return a cached connection for the current thread."""
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(str(self._db_path), timeout=30)
+            conn = connect_private_sqlite(
+                self._db_path, timeout=30, connect=sqlite3.connect
+            )
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return conn

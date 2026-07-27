@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.private_files import prepare_sqlite_path
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1433,9 +1434,12 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
+    database_uri = prepare_sqlite_path(path)
     conn = connect_tracked(
-        path,
+        database_uri,
+        tracking_path=path,
         connect_fn=sqlite3.connect,
+        uri=True,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
@@ -9800,7 +9804,8 @@ def count_notify_subs(
     path = db_path if db_path is not None else kanban_db_path(board=board)
     if not path.exists():
         return 0
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    uri = prepare_sqlite_path(path, read_only=True)
+    conn = sqlite3.connect(uri, uri=True)
     try:
         try:
             owner_where, owner_params = _notify_profile_filter(

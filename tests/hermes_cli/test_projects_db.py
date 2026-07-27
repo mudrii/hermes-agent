@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 
 import pytest
 
@@ -101,3 +102,37 @@ def test_per_profile_isolation(tmp_path):
         b.close()
 
 
+def test_db_path_under_hermes_home():
+    # Resolves under HERMES_HOME (set by the autouse isolation fixture).
+    assert pdb.projects_db_path().name == "projects.db"
+    assert os.path.basename(str(pdb.projects_db_path().parent))  # non-empty parent
+
+
+def test_database_created_owner_only_without_changing_parent(tmp_path):
+    parent = tmp_path / "profile"
+    parent.mkdir(mode=0o755)
+    os.chmod(parent, 0o755)
+    path = parent / "projects.db"
+    old_umask = os.umask(0)
+    try:
+        connection = pdb.connect(path)
+        connection.close()
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+
+
+def test_database_symlink_is_rejected(tmp_path):
+    victim = tmp_path / "victim.db"
+    victim.write_text("do not overwrite")
+    link = tmp_path / "projects.db"
+    try:
+        link.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(OSError, match="symlink"):
+        pdb.connect(link)
+    assert victim.read_text() == "do not overwrite"

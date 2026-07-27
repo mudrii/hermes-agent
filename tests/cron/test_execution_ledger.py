@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,36 @@ def _point_ledger(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
+
+
+def test_execution_database_created_owner_only(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    parent = executions.EXECUTIONS_FILE.parent
+    parent.mkdir(mode=0o755)
+    os.chmod(parent, 0o755)
+    old_umask = os.umask(0)
+    try:
+        executions.create_execution("private", source="builtin")
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(executions.EXECUTIONS_FILE.stat().st_mode) == 0o600
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+
+
+def test_execution_database_symlink_is_rejected(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    victim = tmp_path / "victim.db"
+    victim.write_text("do not overwrite")
+    try:
+        executions.EXECUTIONS_FILE.symlink_to(victim)
+    except OSError as exc:
+        __import__("pytest").skip(f"symlinks unavailable: {exc}")
+
+    with __import__("pytest").raises(OSError, match="symlink"):
+        executions.create_execution("blocked", source="builtin")
+    assert victim.read_text() == "do not overwrite"
 
 
 def test_execution_transitions_are_durable(monkeypatch, tmp_path):

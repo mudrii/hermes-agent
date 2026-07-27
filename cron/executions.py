@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.private_files import connect_private_sqlite
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
@@ -25,8 +26,9 @@ _PROCESS_ID = uuid.uuid4().hex
 
 
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    return connect_private_sqlite(
+        EXECUTIONS_FILE, timeout=5, connect=sqlite3.connect
+    )
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:

@@ -835,8 +835,21 @@ class ResponseStore:
                 db_path = ":memory:"
         self._db_path: Optional[str] = db_path if db_path != ":memory:" else None
         try:
-            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+            if self._db_path is None:
+                self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+            else:
+                from hermes_cli.private_files import connect_private_sqlite
+
+                self._conn = connect_private_sqlite(
+                    self._db_path,
+                    check_same_thread=False,
+                    connect=sqlite3.connect,
+                )
         except Exception:
+            logger.warning(
+                "Response store path is unavailable; using in-memory state",
+                exc_info=True,
+            )
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._db_path = None
         # Use shared WAL-fallback helper so response_store.db degrades

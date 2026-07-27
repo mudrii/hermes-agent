@@ -40,6 +40,7 @@ from agent.skill_commands import (
     describe_skill_invocation,
 )
 from hermes_constants import get_hermes_home
+from hermes_cli.private_files import ensure_private_directory, prepare_sqlite_path
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
@@ -2044,8 +2045,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
+                read_only_uri = prepare_sqlite_path(self.db_path, read_only=True)
                 self._conn = _connect_tracked_db(
-                    f"file:{self.db_path}?mode=ro",
+                    read_only_uri,
                     tracking_path=self.db_path,
                     uri=True,
                     check_same_thread=False,
@@ -2085,7 +2087,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise
                 return
 
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_private_directory(self.db_path.parent)
 
             # Read-only file/sidecar preflight (port of kilocode#12508):
             # repair-or-refuse BEFORE the first connection so users get an
@@ -2124,8 +2126,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise sqlite3.DatabaseError(msg)
 
             def _connect_and_init():
+                database_uri = prepare_sqlite_path(self.db_path)
                 self._conn = _connect_tracked_db(
-                    str(self.db_path),
+                    database_uri,
+                    tracking_path=self.db_path,
+                    uri=True,
                     check_same_thread=False,
                     # Short timeout — application-level retry with random
                     # jitter handles contention instead of sitting in

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import sqlite3
+import stat
 
 import pytest
 
@@ -39,6 +42,50 @@ def test_sessiondb_opens_fresh_after_zeroed_quarantine(tmp_path, monkeypatch):
         assert backups[0].stat().st_size == 4096
     finally:
         sdb.close()
+
+
+def test_sessiondb_created_owner_only_with_private_sidecars(tmp_path):
+    import hermes_state as hs
+
+    parent = tmp_path / "profile"
+    parent.mkdir(mode=0o755)
+    os.chmod(parent, 0o755)
+    db = parent / "state ?# ü.db"
+    old_umask = os.umask(0)
+    try:
+        sdb = hs.SessionDB(db_path=db)
+        sdb.create_session("private", source="cli")
+        sdb.close()
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(db.stat().st_mode) == 0o600
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    for sidecar in (Path(f"{db}-wal"), Path(f"{db}-shm")):
+        if sidecar.exists():
+            assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+
+    read_only = hs.SessionDB(db_path=db, read_only=True)
+    try:
+        assert read_only.get_session("private") is not None
+    finally:
+        read_only.close()
+
+
+def test_sessiondb_symlink_is_rejected(tmp_path):
+    import hermes_state as hs
+
+    victim = tmp_path / "victim.db"
+    victim.write_text("do not overwrite")
+    link = tmp_path / "state.db"
+    try:
+        link.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(OSError, match="symlink"):
+        hs.SessionDB(db_path=link)
+    assert victim.read_text() == "do not overwrite"
 
 
 def test_concurrent_quarantine_no_clobber(tmp_path):

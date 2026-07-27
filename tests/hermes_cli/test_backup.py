@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+import stat
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -139,7 +140,106 @@ class TestShouldExclude:
 # ---------------------------------------------------------------------------
 
 class TestBackup:
+    def test_creates_archive_owner_only_without_changing_parent_mode(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("model: test\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
+        out_dir = tmp_path / "shared-output"
+        out_dir.mkdir(mode=0o755)
+        os.chmod(out_dir, 0o755)
+        out_zip = out_dir / "backup.zip"
+        old_umask = os.umask(0)
+        try:
+            from hermes_cli.backup import run_backup
+
+            run_backup(Namespace(output=str(out_zip)))
+        finally:
+            os.umask(old_umask)
+
+        assert stat.S_IMODE(out_zip.stat().st_mode) == 0o600
+        assert stat.S_IMODE(out_dir.stat().st_mode) == 0o755
+
+    def test_rejects_symlink_archive_destination(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("model: test\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not overwrite")
+        link = tmp_path / "backup.zip"
+        _symlink_file_or_skip(link, victim)
+
+        from hermes_cli.backup import run_backup
+
+        with pytest.raises(OSError, match="symlink"):
+            run_backup(Namespace(output=str(link)))
+        assert victim.read_text() == "do not overwrite"
+
+    def test_failed_sqlite_backup_never_raw_copies_live_wal_db(self, tmp_path, monkeypatch, capsys):
+        """A failed backup() must not silently archive the stale main DB file.
+
+        Keep a real, uncheckpointed WAL transaction live so a raw copy of only
+        ``state.db`` would be a valid-looking but torn snapshot.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("model: test\n")
+        db_path = hermes_home / "state.db"
+
+        writer = sqlite3.connect(db_path)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE events (value TEXT)")
+        writer.commit()
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        writer.execute("INSERT INTO events VALUES ('only-in-wal')")
+        writer.commit()
+        assert Path(f"{db_path}-wal").stat().st_size > 0
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_connect = backup_mod.sqlite3.connect
+
+        class FailingBackupConnection:
+            def __init__(self, connection):
+                self._connection = connection
+
+            def backup(self, _destination):
+                raise sqlite3.OperationalError("forced backup failure")
+
+            def close(self):
+                self._connection.close()
+
+        def connect_with_failed_backup(database, *args, **kwargs):
+            connection = real_connect(database, *args, **kwargs)
+            if str(database).startswith(f"file:{db_path}"):
+                return FailingBackupConnection(connection)
+            return connection
+
+        monkeypatch.setattr(backup_mod.sqlite3, "connect", connect_with_failed_backup)
+        out_zip = tmp_path / "backup.zip"
+        try:
+            backup_mod.run_backup(Namespace(output=str(out_zip)))
+        finally:
+            writer.close()
+
+        with zipfile.ZipFile(out_zip) as zf:
+            assert "config.yaml" in zf.namelist()
+            assert "state.db" not in zf.namelist()
+
+        output = capsys.readouterr().out
+        assert "Backup incomplete" in output
+        assert "state.db: SQLite safe copy failed" in output
+        assert "Restore with:" not in output
 
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):
         """SQLite staging temp files must be created on the output zip's
@@ -628,6 +728,68 @@ class TestSafeCopyDb:
         conn.close()
         assert rows == [(42,)]
 
+    def test_special_characters_are_literal_and_destination_is_owner_only(
+        self, tmp_path
+    ):
+        from hermes_cli.backup import _safe_copy_db
+
+        src = tmp_path / "state ?# ü.db"
+        dst = tmp_path / "copy ?# ü.db"
+        with sqlite3.connect(src) as conn:
+            conn.execute("CREATE TABLE t (value TEXT)")
+            conn.execute("INSERT INTO t VALUES ('preserved')")
+
+        old_umask = os.umask(0)
+        try:
+            assert _safe_copy_db(src, dst) is True
+        finally:
+            os.umask(old_umask)
+
+        with sqlite3.connect(dst) as conn:
+            assert conn.execute("SELECT value FROM t").fetchall() == [("preserved",)]
+        assert stat.S_IMODE(dst.stat().st_mode) == 0o600
+
+    def test_rejects_symlink_destination_without_touching_target(self, tmp_path):
+        from hermes_cli.backup import _safe_copy_db
+
+        src = tmp_path / "source.db"
+        with sqlite3.connect(src) as conn:
+            conn.execute("CREATE TABLE source_data (value TEXT)")
+            conn.execute("INSERT INTO source_data VALUES ('source')")
+        victim = tmp_path / "victim.db"
+        with sqlite3.connect(victim) as conn:
+            conn.execute("CREATE TABLE victim_data (value TEXT)")
+            conn.execute("INSERT INTO victim_data VALUES ('preserved')")
+        link = tmp_path / "copy.db"
+        _symlink_file_or_skip(link, victim)
+
+        assert _safe_copy_db(src, link) is False
+        with sqlite3.connect(victim) as conn:
+            assert conn.execute("SELECT value FROM victim_data").fetchall() == [
+                ("preserved",)
+            ]
+
+    def test_copies_wal_mode_database(self, tmp_path):
+        from hermes_cli.backup import _safe_copy_db
+        src = tmp_path / "wal.db"
+        dst = tmp_path / "copy.db"
+
+        conn = sqlite3.connect(str(src))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t (x TEXT)")
+        conn.execute("INSERT INTO t VALUES ('wal-test')")
+        conn.commit()
+        conn.close()
+
+        result = _safe_copy_db(src, dst)
+        assert result is True
+
+        conn = sqlite3.connect(str(dst))
+        rows = conn.execute("SELECT x FROM t").fetchall()
+        conn.close()
+        assert rows == [("wal-test",)]
+
+
 
     def test_is_zeroed_sqlite_file_detects_nul_header(self, tmp_path):
         from hermes_cli.backup import is_zeroed_sqlite_file
@@ -665,6 +827,44 @@ class TestQuickSnapshot:
         return home
 
 
+    def test_snapshot_tree_is_owner_only_without_changing_home_mode(self, hermes_home):
+        from hermes_cli.backup import create_quick_snapshot
+
+        os.chmod(hermes_home, 0o755)
+        old_umask = os.umask(0)
+        try:
+            snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        finally:
+            os.umask(old_umask)
+
+        root = hermes_home / "state-snapshots"
+        snap_dir = root / snap_id
+        assert stat.S_IMODE(hermes_home.stat().st_mode) == 0o755
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(snap_dir.stat().st_mode) == 0o700
+        for path in snap_dir.rglob("*"):
+            expected = 0o700 if path.is_dir() else 0o600
+            assert stat.S_IMODE(path.stat().st_mode) == expected, path
+
+    def test_snapshot_skips_symlinked_state_file(self, hermes_home, tmp_path):
+        from hermes_cli.backup import create_quick_snapshot
+
+        secret = tmp_path / "outside-secret"
+        secret.write_text("must not be captured")
+        auth = hermes_home / "auth.json"
+        auth.unlink()
+        _symlink_file_or_skip(auth, secret)
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        snap_dir = hermes_home / "state-snapshots" / snap_id
+        manifest = json.loads((snap_dir / "manifest.json").read_text())
+        assert "auth.json" not in manifest["files"]
+        assert not (snap_dir / "auth.json").exists()
+
+    def test_label_in_id(self, hermes_home):
+        from hermes_cli.backup import create_quick_snapshot
+        snap_id = create_quick_snapshot(label="before-upgrade", hermes_home=hermes_home)
+        assert "before-upgrade" in snap_id
 
     def test_state_db_safely_copied(self, hermes_home):
         from hermes_cli.backup import create_quick_snapshot

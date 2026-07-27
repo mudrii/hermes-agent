@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
+from hermes_cli.private_files import connect_private_sqlite
 from hermes_constants import get_hermes_home
 
 # ---------------------------------------------------------------------------
@@ -160,9 +161,8 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     EXISTS`` + additive migrations) and cached per-path per-process.
     """
     path = db_path if db_path is not None else projects_db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    resolved = str(path.resolve())
-    conn = sqlite3.connect(str(path))
+    resolved = os.path.abspath(os.fspath(path))
+    conn = connect_private_sqlite(path, connect=sqlite3.connect)
     try:
         conn.row_factory = sqlite3.Row
         from hermes_state import apply_wal_with_fallback

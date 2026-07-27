@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.private_files import connect_private_sqlite
 
 
 _DB_LOCK = threading.Lock()
@@ -64,8 +65,7 @@ def _connect() -> sqlite3.Connection:
     from hermes_state import apply_wal_with_fallback
 
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = connect_private_sqlite(path, connect=sqlite3.connect)
     conn.row_factory = sqlite3.Row
     try:
         apply_wal_with_fallback(conn, db_label="verification_evidence.db")
