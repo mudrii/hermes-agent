@@ -149,7 +149,9 @@ def default_db_path() -> Path:
 
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
-    uri = f"file:{db_path}?mode=ro"
+    from hermes_cli.private_files import prepare_sqlite_path
+
+    uri = prepare_sqlite_path(db_path, read_only=True)
     return sqlite3.connect(uri, uri=True)
 
 

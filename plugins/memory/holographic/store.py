@@ -8,6 +8,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from hermes_cli.private_files import connect_private_sqlite
+
 try:
     from . import holographic as hrr
 except ImportError:
@@ -123,24 +125,23 @@ class MemoryStore:
             from hermes_constants import get_hermes_home
             db_path = str(get_hermes_home() / "memory_store.db")
         self.db_path = Path(db_path).expanduser()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.db_path.is_symlink():
+            raise OSError(f"refusing symlink database path: {self.db_path}")
         self.default_trust = _clamp_trust(default_trust)
         self.hrr_dim = hrr_dim
         self._hrr_available = hrr._HAS_NUMPY
 
         # Acquire (or open) the process-wide shared connection for this DB.
-        # resolve() (not just expanduser) so symlinked/relative paths to the
-        # same file share ONE connection instead of silently reintroducing
-        # the multi-writer contention this registry exists to prevent.
-        try:
-            self._key = str(self.db_path.resolve())
-        except OSError:
-            self._key = str(self.db_path)
+        # Resolve the parent so aliases of the containing directory share one
+        # registry entry, while the final database component above remains a
+        # required real file rather than a symlink.
+        self._key = str(self.db_path.parent.resolve() / self.db_path.name)
         with MemoryStore._shared_guard:
             entry = MemoryStore._shared.get(self._key)
             if entry is None:
-                conn = sqlite3.connect(
+                conn = connect_private_sqlite(
                     self._key,
+                    connect=sqlite3.connect,
                     check_same_thread=False,
                     timeout=10.0,
                     # Autocommit: every statement is its own transaction, so a

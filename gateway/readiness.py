@@ -36,7 +36,9 @@ def _probe_state_db(home: Path) -> dict[str, Any]:
         # only commits/rolls back — it never closes, so a bare ``with
         # sqlite3.connect(...)`` leaks one connection (and its fds) per
         # health poll in the long-running gateway (#69678/#69567 bug class).
-        uri = f"file:{path.as_posix()}?mode=ro"
+        from hermes_cli.private_files import prepare_sqlite_path
+
+        uri = prepare_sqlite_path(path, read_only=True)
         with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
             conn.execute("PRAGMA query_only = ON")
             conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()

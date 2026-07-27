@@ -22,6 +22,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from hermes_cli.private_files import (
+    copy_private_file,
+    ensure_private_directory,
+    open_private_binary,
+    open_private_text,
+    prepare_sqlite_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -263,14 +270,17 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
     conn = None
     backup_conn = None
     try:
-        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        backup_conn = sqlite3.connect(str(dst))
+        source_uri = prepare_sqlite_path(src, read_only=True)
+        destination_uri = prepare_sqlite_path(dst)
+        conn = sqlite3.connect(source_uri, uri=True)
+        backup_conn = sqlite3.connect(destination_uri, uri=True)
         conn.backup(backup_conn)
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
         try:
-            dst.unlink(missing_ok=True)
+            if not dst.is_symlink():
+                dst.unlink(missing_ok=True)
         except OSError:
             pass
         return False
@@ -411,7 +421,8 @@ def verify_sqlite_integrity(
         run_pragma = False
         probe = None
         try:
-            probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+            uri = prepare_sqlite_path(path, read_only=True)
+            probe = sqlite3.connect(uri, uri=True, timeout=1.0)
             probe.execute("PRAGMA schema_version").fetchone()
             probe.execute("SELECT count(*) FROM sqlite_master").fetchone()
             result["valid"] = True
@@ -437,7 +448,8 @@ def verify_sqlite_integrity(
     if run_pragma:
         conn = None
         try:
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+            uri = prepare_sqlite_path(path, read_only=True)
+            conn = sqlite3.connect(uri, uri=True, timeout=1.0)
             cursor = conn.execute("PRAGMA integrity_check")
             rows = cursor.fetchall()
             if len(rows) == 1 and rows[0][0] == "ok":
@@ -511,7 +523,9 @@ def run_backup(args) -> None:
 
     # Determine output path
     if args.output:
-        out_path = Path(args.output).expanduser().resolve()
+        out_path = Path(os.path.abspath(os.fspath(Path(args.output).expanduser())))
+        if out_path.is_symlink():
+            raise OSError(f"refusing symlink backup destination: {out_path}")
         # If user gave a directory, put the zip inside it
         if out_path.is_dir():
             stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
@@ -524,8 +538,9 @@ def run_backup(args) -> None:
     if out_path.suffix.lower() != ".zip":
         out_path = out_path.with_suffix(out_path.suffix + ".zip")
 
-    # Ensure parent directory exists
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Ensure parent directory exists. Missing directories are private; existing
+    # user-selected directories retain their operator-chosen mode.
+    ensure_private_directory(out_path.parent)
 
     # Collect files
     print(f"Scanning {display_hermes_home()} ...")
@@ -593,6 +608,8 @@ def run_backup(args) -> None:
     errors = []
     t0 = time.monotonic()
 
+    with open_private_binary(out_path):
+        pass
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
@@ -1034,6 +1051,7 @@ def create_quick_snapshot(
     """
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
+    ensure_private_directory(root)
 
     def _too_large(path: Path, rel_name: str) -> bool:
         """True (and warn) when ``path`` exceeds the max_file_size cap."""
@@ -1060,7 +1078,7 @@ def create_quick_snapshot(
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     snap_id = f"{ts}-{label}" if label else ts
     snap_dir = root / snap_id
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(snap_dir)
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
     failed_dbs: list[str] = []  # present *.db that could not be snapshotted
@@ -1072,6 +1090,9 @@ def create_quick_snapshot(
 
     for rel in _QUICK_STATE_FILES:
         src = home / rel
+        if src.is_symlink():
+            logger.warning("Skipping symlinked snapshot source: %s", rel)
+            continue
         if not src.exists():
             continue
 
@@ -1080,6 +1101,9 @@ def create_quick_snapshot(
             # manifest so restore can treat them uniformly.  Empty dirs are
             # skipped (nothing to snapshot).
             for sub in src.rglob("*"):
+                if sub.is_symlink():
+                    logger.warning("Skipping symlinked snapshot source: %s", sub)
+                    continue
                 if not sub.is_file():
                     continue
                 sub_rel = sub.relative_to(home).as_posix()
@@ -1093,7 +1117,7 @@ def create_quick_snapshot(
                         oversized_skipped.append(sub_rel)
                     continue
                 dst = snap_dir / sub_rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
+                ensure_private_directory(dst.parent)
                 try:
                     # Route SQLite DBs through the WAL-safe backup() path so a
                     # board DB with an open WAL (the gateway may hold it at
@@ -1112,7 +1136,7 @@ def create_quick_snapshot(
                                 )
                             continue
                     else:
-                        shutil.copy2(sub, dst)
+                        copy_private_file(sub, dst)
                     manifest[sub_rel] = dst.stat().st_size
                 except (OSError, PermissionError) as exc:
                     logger.warning("Could not snapshot %s: %s", sub_rel, exc)
@@ -1127,7 +1151,7 @@ def create_quick_snapshot(
             continue
 
         dst = snap_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(dst.parent)
 
         try:
             if src.suffix == ".db":
@@ -1144,7 +1168,7 @@ def create_quick_snapshot(
                         )
                     continue
             else:
-                shutil.copy2(src, dst)
+                copy_private_file(src, dst)
             manifest[rel] = dst.stat().st_size
         except (OSError, PermissionError) as exc:
             logger.warning("Could not snapshot %s: %s", rel, exc)
@@ -1187,7 +1211,7 @@ def create_quick_snapshot(
         "failed_dbs": failed_dbs,
         "oversized_skipped": oversized_skipped,
     }
-    with open(snap_dir / "manifest.json", "w", encoding="utf-8") as f:
+    with open_private_text(snap_dir / "manifest.json", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
     # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
@@ -1515,7 +1539,12 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
 
     sqlite_snapshot_failed = False
     try:
-        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        ensure_private_directory(out_path.parent)
+        with open_private_binary(out_path):
+            pass
+        with zipfile.ZipFile(
+            out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as zf:
             for abs_path, rel_path in files_to_add:
                 try:
                     if abs_path.suffix == ".db":
@@ -1633,7 +1662,7 @@ def create_pre_update_backup(
 
     backup_dir = _pre_update_backup_dir(hermes_root)
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(backup_dir)
     except OSError as exc:
         logger.warning("Could not create pre-update backup dir %s: %s", backup_dir, exc)
         return None
@@ -1710,7 +1739,7 @@ def create_pre_migration_backup(
     # update-backup listing pick up pre-migration archives too.
     backup_dir = _pre_update_backup_dir(hermes_root)
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(backup_dir)
     except OSError as exc:
         logger.warning("Could not create pre-migration backup dir %s: %s", backup_dir, exc)
         return None

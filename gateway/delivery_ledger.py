@@ -50,6 +50,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.private_files import connect_private_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +78,7 @@ def _db_path():
 
 def _connect() -> sqlite3.Connection:
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    conn = connect_private_sqlite(path, timeout=10, connect=sqlite3.connect)
     try:
         _initialize_schema(conn)
     except Exception:

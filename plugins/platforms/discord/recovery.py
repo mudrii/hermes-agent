@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from hermes_constants import get_hermes_home
+from hermes_cli.private_files import connect_private_sqlite, ensure_private_directory
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +30,20 @@ class DiscordRecoveryStore:
 
     def path(self) -> Path:
         directory = self._hermes_home / "gateway"
-        directory.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(directory)
         return directory / _DB_FILENAME
 
     def call(self, fn: Callable[[sqlite3.Connection], Any], default: Any = None) -> Any:
         try:
             with self._lock:
                 path = self.path()
-                conn = sqlite3.connect(path, timeout=0.1)
+                conn = connect_private_sqlite(
+                    path, timeout=0.1, connect=sqlite3.connect
+                )
                 try:
                     if not self._initialized:
                         self._initialize(conn)
                         self._initialized = True
-                        with suppress(OSError):
-                            os.chmod(path, 0o600)
                     result = fn(conn)
                     conn.commit()
                     return result
