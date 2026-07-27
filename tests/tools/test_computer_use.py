@@ -1306,6 +1306,7 @@ class TestLazyMcpInstall:
         assert lazy_deps.feature_specs("tool.computer_use") == (
             "mcp==1.28.1",
             "starlette==1.3.1",
+            "pydantic-settings==2.14.2",
         )
 
     def test_start_lazy_installs_mcp(self):
