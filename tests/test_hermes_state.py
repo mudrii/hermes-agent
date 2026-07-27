@@ -3,6 +3,8 @@
 import sqlite3
 import time
 import json
+import os
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -75,6 +77,25 @@ def db(tmp_path):
     session_db = SessionDB(db_path=db_path)
     yield session_db
     session_db.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
+def test_session_db_creates_owner_only_files_under_permissive_umask(tmp_path):
+    db_path = tmp_path / "private-state" / "state.db"
+    session_db = None
+    old_umask = os.umask(0)
+    try:
+        session_db = SessionDB(db_path=db_path)
+        session_db.create_session(session_id="private", source="cli", model="test")
+
+        assert db_path.parent.stat().st_mode & 0o777 == 0o700
+        for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+            if path.exists():
+                assert path.stat().st_mode & 0o777 == 0o600
+    finally:
+        if session_db is not None:
+            session_db.close()
+        os.umask(old_umask)
 
 
 # =========================================================================

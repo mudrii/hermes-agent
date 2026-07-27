@@ -88,6 +88,34 @@ _EXCLUDED_NAMES = {
     "cron.pid",
 }
 
+
+def _secure_private_dir(path: Path) -> None:
+    """Create/tighten a directory to owner-only access on POSIX."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except (OSError, NotImplementedError):
+        pass
+
+
+def _prepare_private_file(path: Path) -> None:
+    """Ensure *path* exists without granting group/world access."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, AttributeError, NotImplementedError):
+            pass
+    finally:
+        os.close(fd)
+
+
+def _secure_private_file(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except (OSError, NotImplementedError):
+        pass
+
 # File names that ``hermes import`` must never overwrite, matched by basename so
 # they're caught for the root profile (``gateway_state.json``) and for named
 # profiles alike (``profiles/<name>/gateway_state.json``).
@@ -263,9 +291,12 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
     conn = None
     backup_conn = None
     try:
+        _secure_private_dir(dst.parent)
+        _prepare_private_file(dst)
         conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
         backup_conn = sqlite3.connect(str(dst))
         conn.backup(backup_conn)
+        _secure_private_file(dst)
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
@@ -524,8 +555,8 @@ def run_backup(args) -> None:
     if out_path.suffix.lower() != ".zip":
         out_path = out_path.with_suffix(out_path.suffix + ".zip")
 
-    # Ensure parent directory exists
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Backup archives contain credentials and private state.
+    _secure_private_dir(out_path.parent)
 
     # Collect files
     print(f"Scanning {display_hermes_home()} ...")
@@ -593,6 +624,7 @@ def run_backup(args) -> None:
     errors = []
     t0 = time.monotonic()
 
+    _prepare_private_file(out_path)
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
@@ -1060,7 +1092,8 @@ def create_quick_snapshot(
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     snap_id = f"{ts}-{label}" if label else ts
     snap_dir = root / snap_id
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    _secure_private_dir(root)
+    _secure_private_dir(snap_dir)
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
     failed_dbs: list[str] = []  # present *.db that could not be snapshotted
@@ -1093,7 +1126,7 @@ def create_quick_snapshot(
                         oversized_skipped.append(sub_rel)
                     continue
                 dst = snap_dir / sub_rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
+                _secure_private_dir(dst.parent)
                 try:
                     # Route SQLite DBs through the WAL-safe backup() path so a
                     # board DB with an open WAL (the gateway may hold it at
@@ -1113,6 +1146,7 @@ def create_quick_snapshot(
                             continue
                     else:
                         shutil.copy2(sub, dst)
+                        _secure_private_file(dst)
                     manifest[sub_rel] = dst.stat().st_size
                 except (OSError, PermissionError) as exc:
                     logger.warning("Could not snapshot %s: %s", sub_rel, exc)
@@ -1127,7 +1161,7 @@ def create_quick_snapshot(
             continue
 
         dst = snap_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        _secure_private_dir(dst.parent)
 
         try:
             if src.suffix == ".db":
@@ -1145,6 +1179,7 @@ def create_quick_snapshot(
                     continue
             else:
                 shutil.copy2(src, dst)
+                _secure_private_file(dst)
             manifest[rel] = dst.stat().st_size
         except (OSError, PermissionError) as exc:
             logger.warning("Could not snapshot %s: %s", rel, exc)
@@ -1187,7 +1222,9 @@ def create_quick_snapshot(
         "failed_dbs": failed_dbs,
         "oversized_skipped": oversized_skipped,
     }
-    with open(snap_dir / "manifest.json", "w", encoding="utf-8") as f:
+    manifest_path = snap_dir / "manifest.json"
+    _prepare_private_file(manifest_path)
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
     # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers

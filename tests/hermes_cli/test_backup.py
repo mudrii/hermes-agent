@@ -227,6 +227,28 @@ class TestBackup:
             # Skins
             assert "skins/cyber.yaml" in names
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
+    def test_creates_owner_only_archive_and_parent_under_permissive_umask(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out_zip = tmp_path / "new-backups" / "backup.zip"
+        old_umask = os.umask(0)
+        try:
+            from hermes_cli.backup import run_backup
+
+            run_backup(Namespace(output=str(out_zip)))
+        finally:
+            os.umask(old_umask)
+
+        assert out_zip.stat().st_mode & 0o777 == 0o600
+        assert out_zip.parent.stat().st_mode & 0o777 == 0o700
+
     def test_failed_sqlite_backup_never_raw_copies_live_wal_db(self, tmp_path, monkeypatch, capsys):
         """A failed backup() must not silently archive the stale main DB file.
 
@@ -1489,6 +1511,22 @@ class TestQuickSnapshot:
         snap_dir = hermes_home / "state-snapshots" / snap_id
         assert snap_dir.is_dir()
         assert (snap_dir / "manifest.json").exists()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
+    def test_creates_owner_only_tree_under_permissive_umask(self, hermes_home):
+        from hermes_cli.backup import create_quick_snapshot
+
+        old_umask = os.umask(0)
+        try:
+            snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        finally:
+            os.umask(old_umask)
+
+        snap_dir = hermes_home / "state-snapshots" / snap_id
+        for directory in (snap_dir.parent, snap_dir, snap_dir / "cron"):
+            assert directory.stat().st_mode & 0o777 == 0o700
+        for rel in ("manifest.json", "config.yaml", ".env", "state.db", "cron/jobs.json"):
+            assert (snap_dir / rel).stat().st_mode & 0o777 == 0o600
 
     def test_label_in_id(self, hermes_home):
         from hermes_cli.backup import create_quick_snapshot

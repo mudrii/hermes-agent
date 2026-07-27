@@ -1928,7 +1928,11 @@ class SessionDB:
                 self._conn.row_factory = sqlite3.Row
                 return
 
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                self.db_path.parent.chmod(0o700)
+            except (OSError, NotImplementedError):
+                pass
 
             # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
             # generic "file is not a database" with no recovery path. Quarantine
@@ -1959,6 +1963,18 @@ class SessionDB:
                 if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
                     raise sqlite3.DatabaseError(msg)
 
+            # SQLite has no creation-mode parameter. Pre-create the main file
+            # owner-only so a permissive process umask cannot expose session
+            # data, even briefly, before the connection is initialized.
+            db_fd = os.open(self.db_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                try:
+                    os.fchmod(db_fd, 0o600)
+                except (OSError, AttributeError, NotImplementedError):
+                    pass
+            finally:
+                os.close(db_fd)
+
             def _connect_and_init():
                 self._conn = _connect_tracked_db(
                     str(self.db_path),
@@ -1974,6 +1990,16 @@ class SessionDB:
                 )
                 self._conn.row_factory = sqlite3.Row
                 apply_wal_with_fallback(self._conn, db_label="state.db")
+                for private_path in (
+                    self.db_path,
+                    Path(f"{self.db_path}-wal"),
+                    Path(f"{self.db_path}-shm"),
+                ):
+                    try:
+                        if private_path.exists():
+                            private_path.chmod(0o600)
+                    except (OSError, NotImplementedError):
+                        pass
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
