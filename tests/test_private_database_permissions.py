@@ -42,9 +42,12 @@ def test_simple_sqlite_stores_create_owner_only_without_changing_parent(
     assert _mode(parent) == 0o755
 
 
-def test_kanban_database_is_owner_only_without_changing_parent(tmp_path):
+def test_kanban_database_is_owner_only_without_changing_parent(
+    tmp_path, monkeypatch
+):
     from hermes_cli import kanban_db
 
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
     parent = tmp_path / "kanban-parent"
     parent.mkdir(mode=0o755)
     path = parent / "kanban.db"

@@ -25,7 +25,7 @@ from hermes_constants import get_default_hermes_root, get_hermes_home, display_h
 from hermes_cli.private_files import (
     copy_private_file,
     ensure_private_directory,
-    open_private_binary,
+    open_private_atomic_binary,
     open_private_text,
     prepare_sqlite_path,
 )
@@ -608,50 +608,52 @@ def run_backup(args) -> None:
     errors = []
     t0 = time.monotonic()
 
-    with open_private_binary(out_path):
-        pass
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
-            try:
-                # Safe copy for SQLite databases (handles WAL mode)
-                if abs_path.suffix == ".db":
-                    # Stage the snapshot alongside the output zip so that the
-                    # temp file lives on the same filesystem.  The system
-                    # default (/tmp) may be a small tmpfs that cannot hold
-                    # large databases, causing silent backup incompleteness.
-                    with tempfile.NamedTemporaryFile(
-                        suffix=".db", delete=False, dir=str(out_path.parent)
-                    ) as tmp:
-                        tmp_db = Path(tmp.name)
-                    if _safe_copy_db(abs_path, tmp_db):
-                        zf.write(tmp_db, arcname=str(rel_path))
-                        total_bytes += tmp_db.stat().st_size
-                        tmp_db.unlink(missing_ok=True)
+    with open_private_atomic_binary(out_path) as archive:
+        with zipfile.ZipFile(
+            archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as zf:
+            for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
+                try:
+                    # Safe copy for SQLite databases (handles WAL mode)
+                    if abs_path.suffix == ".db":
+                        # Stage the snapshot alongside the output zip so that the
+                        # temp file lives on the same filesystem.  The system
+                        # default (/tmp) may be a small tmpfs that cannot hold
+                        # large databases, causing silent backup incompleteness.
+                        with tempfile.NamedTemporaryFile(
+                            suffix=".db", delete=False, dir=str(out_path.parent)
+                        ) as tmp:
+                            tmp_db = Path(tmp.name)
+                        try:
+                            if _safe_copy_db(abs_path, tmp_db):
+                                zf.write(tmp_db, arcname=str(rel_path))
+                                total_bytes += tmp_db.stat().st_size
+                            else:
+                                errors.append(f"  {rel_path}: SQLite safe copy failed")
+                                continue
+                        finally:
+                            tmp_db.unlink(missing_ok=True)
                     else:
-                        tmp_db.unlink(missing_ok=True)
-                        errors.append(f"  {rel_path}: SQLite safe copy failed")
-                        continue
-                else:
-                    zf.write(abs_path, arcname=str(rel_path))
+                        zf.write(abs_path, arcname=str(rel_path))
+                        total_bytes += abs_path.stat().st_size
+                except (PermissionError, OSError, ValueError) as exc:
+                    errors.append(f"  {rel_path}: {exc}")
+                    continue
+
+                # Progress every 500 files
+                if i % 500 == 0:
+                    print(f"  {i}/{file_count} files ...")
+
+            # External memory-provider state, stored under the ``_external/`` arc
+            # prefix. These never include ``.db`` files in practice (config/env
+            # blobs), so a straight zf.write is fine.
+            for abs_path, arcname in external_to_add:
+                try:
+                    zf.write(abs_path, arcname=arcname)
                     total_bytes += abs_path.stat().st_size
-            except (PermissionError, OSError, ValueError) as exc:
-                errors.append(f"  {rel_path}: {exc}")
-                continue
-
-            # Progress every 500 files
-            if i % 500 == 0:
-                print(f"  {i}/{file_count} files ...")
-
-        # External memory-provider state, stored under the ``_external/`` arc
-        # prefix. These never include ``.db`` files in practice (config/env
-        # blobs), so a straight zf.write is fine.
-        for abs_path, arcname in external_to_add:
-            try:
-                zf.write(abs_path, arcname=arcname)
-                total_bytes += abs_path.stat().st_size
-            except (PermissionError, OSError, ValueError) as exc:
-                errors.append(f"  {arcname}: {exc}")
-                continue
+                except (PermissionError, OSError, ValueError) as exc:
+                    errors.append(f"  {arcname}: {exc}")
+                    continue
 
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
@@ -1540,52 +1542,41 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     sqlite_snapshot_failed = False
     try:
         ensure_private_directory(out_path.parent)
-        with open_private_binary(out_path):
-            pass
-        with zipfile.ZipFile(
-            out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
-        ) as zf:
-            for abs_path, rel_path in files_to_add:
-                try:
-                    if abs_path.suffix == ".db":
-                        # Stage the snapshot alongside the output zip so that the
-                        # temp file lives on the same filesystem.  The system
-                        # default (/tmp) may be a small tmpfs that cannot hold
-                        # large databases, causing silent backup incompleteness.
-                        with tempfile.NamedTemporaryFile(
-                            suffix=".db", delete=False, dir=str(out_path.parent)
-                        ) as tmp:
-                            tmp_db = Path(tmp.name)
-                        try:
-                            if not _safe_copy_db(abs_path, tmp_db):
-                                logger.warning(
-                                    "Full-zip backup aborted: SQLite snapshot failed for %s",
-                                    rel_path,
-                                )
-                                sqlite_snapshot_failed = True
-                                break
-                            zf.write(tmp_db, arcname=str(rel_path))
-                        finally:
-                            tmp_db.unlink(missing_ok=True)
-                    else:
-                        zf.write(abs_path, arcname=str(rel_path))
-                except (PermissionError, OSError, ValueError) as exc:
-                    logger.debug("Skipping %s in zip backup: %s", rel_path, exc)
-                    continue
+        with open_private_atomic_binary(out_path) as archive:
+            with zipfile.ZipFile(
+                archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+            ) as zf:
+                for abs_path, rel_path in files_to_add:
+                    try:
+                        if abs_path.suffix == ".db":
+                            # Stage the snapshot alongside the output zip so that the
+                            # temp file lives on the same filesystem.  The system
+                            # default (/tmp) may be a small tmpfs that cannot hold
+                            # large databases, causing silent backup incompleteness.
+                            with tempfile.NamedTemporaryFile(
+                                suffix=".db", delete=False, dir=str(out_path.parent)
+                            ) as tmp:
+                                tmp_db = Path(tmp.name)
+                            try:
+                                if not _safe_copy_db(abs_path, tmp_db):
+                                    logger.warning(
+                                        "Full-zip backup aborted: SQLite snapshot failed for %s",
+                                        rel_path,
+                                    )
+                                    sqlite_snapshot_failed = True
+                                    break
+                                zf.write(tmp_db, arcname=str(rel_path))
+                            finally:
+                                tmp_db.unlink(missing_ok=True)
+                        else:
+                            zf.write(abs_path, arcname=str(rel_path))
+                    except (PermissionError, OSError, ValueError) as exc:
+                        logger.debug("Skipping %s in zip backup: %s", rel_path, exc)
+                        continue
+            if sqlite_snapshot_failed:
+                raise OSError("SQLite snapshot failed; refusing partial zip publication")
     except OSError as exc:
         logger.warning("Full-zip backup: zip write failed: %s", exc)
-        # Best-effort cleanup of partial file
-        try:
-            out_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return None
-
-    if sqlite_snapshot_failed:
-        try:
-            out_path.unlink(missing_ok=True)
-        except OSError:
-            pass
         return None
 
     return out_path

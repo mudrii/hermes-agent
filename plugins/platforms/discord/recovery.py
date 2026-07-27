@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import os
 import sqlite3
 import threading
-from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable
 
