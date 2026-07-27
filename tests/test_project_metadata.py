@@ -94,6 +94,44 @@ def _exact_pins(specs):
     return pins
 
 
+def test_security_fixed_runtime_pins_are_durable_across_install_surfaces():
+    """Security-fixed runtime packages must survive update and lazy install."""
+    from tools.lazy_deps import LAZY_DEPS
+
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        project = tomllib.load(handle)["project"]
+
+    core = _exact_pins(project["dependencies"])
+    optional = project["optional-dependencies"]
+
+    assert core["cryptography"] == "48.0.1"
+    assert core["pillow"] == "12.3.0"
+
+    expected = {
+        "mcp": "1.28.1",
+        "starlette": "1.3.1",
+        "python-multipart": "0.0.31",
+    }
+    for extra in ("dev", "mcp", "computer-use", "web"):
+        pins = _exact_pins(optional[extra])
+        for package, version in expected.items():
+            if package in pins:
+                assert pins[package] == version
+
+    lazy_expected = {
+        "tool.computer_use": {"mcp": "1.28.1", "starlette": "1.3.1"},
+        "tool.dashboard": {
+            "starlette": "1.3.1",
+            "python-multipart": "0.0.31",
+        },
+        "tool.vision": {"pillow": "12.3.0"},
+    }
+    for feature, expected_pins in lazy_expected.items():
+        pins = _exact_pins(LAZY_DEPS[feature])
+        assert {package: pins[package] for package in expected_pins} == expected_pins
+
+
 def test_pyproject_aiohttp_pins_match_lazy_slack_pin():
     """Avoid update/lazy-install churn from conflicting aiohttp pins.
 
