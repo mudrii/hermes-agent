@@ -270,6 +270,37 @@ class TestBackup:
             run_backup(Namespace(output=str(link)))
         assert victim.read_text() == "do not overwrite"
 
+    @pytest.mark.parametrize("preexisting", [False, True])
+    def test_fatal_zip_failure_never_publishes_partial_archive(
+        self, tmp_path, monkeypatch, preexisting
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("model: test\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out_zip = tmp_path / "backup.zip"
+        previous = b"known-good-backup"
+        if preexisting:
+            out_zip.write_bytes(previous)
+
+        import hermes_cli.backup as backup_mod
+
+        def fail_zip_open(archive, *args, **kwargs):
+            archive.write(b"partial archive")
+            raise OSError("forced zip creation failure")
+
+        monkeypatch.setattr(backup_mod.zipfile, "ZipFile", fail_zip_open)
+
+        with pytest.raises(OSError, match="forced zip creation failure"):
+            backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        if preexisting:
+            assert out_zip.read_bytes() == previous
+        else:
+            assert not out_zip.exists()
+
     def test_failed_sqlite_backup_never_raw_copies_live_wal_db(self, tmp_path, monkeypatch, capsys):
         """A failed backup() must not silently archive the stale main DB file.
 

@@ -14,6 +14,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import tempfile
 import warnings
 from pathlib import Path
 from typing import IO, Any, Callable, Iterator, Union
@@ -61,13 +62,30 @@ def _verify_mode(path: Path, expected: int) -> None:
 def ensure_private_directory(path: Pathish) -> bool:
     """Ensure *path* is a directory; create missing components as 0700.
 
-    Existing directories are validated but never chmodded.  Returns ``True``
-    only when the final directory was created by this call.
+    Existing directories, including user-selected directory symlinks, are
+    validated but never chmodded. Returns ``True`` only when the final
+    directory was created by this call.
     """
     path = Path(path).expanduser()
     st = _lstat(path)
-    _reject_symlink(path, st)
     if st is not None:
+        if stat.S_ISLNK(st.st_mode):
+            # A symlinked HERMES_HOME and other operator-selected directory
+            # links are supported. File destinations remain lstat-guarded and
+            # are never followed by the file-opening helpers.
+            try:
+                target = path.stat()
+            except OSError as exc:
+                raise OSError(
+                    errno.ELOOP,
+                    f"private directory symlink is not usable: {path}",
+                    str(path),
+                ) from exc
+            if not stat.S_ISDIR(target.st_mode):
+                raise NotADirectoryError(
+                    f"private directory path is not a directory: {path}"
+                )
+            return False
         if not stat.S_ISDIR(st.st_mode):
             raise NotADirectoryError(f"private directory path is not a directory: {path}")
         return False
@@ -82,7 +100,17 @@ def ensure_private_directory(path: Pathish) -> bool:
         # Another creator won the race. Validate it; do not chmod an object we
         # did not create.
         st = _lstat(path)
-        _reject_symlink(path, st)
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            try:
+                target = path.stat()
+            except OSError as exc:
+                raise OSError(
+                    errno.ELOOP,
+                    f"private directory symlink is not usable: {path}",
+                    str(path),
+                ) from exc
+            if stat.S_ISDIR(target.st_mode):
+                return False
         if st is None or not stat.S_ISDIR(st.st_mode):
             raise NotADirectoryError(f"private directory path is not a directory: {path}")
         return False
@@ -166,6 +194,75 @@ def open_private_text(path: Pathish, *, encoding: str = "utf-8") -> Iterator[IO[
         handle.close()
 
 
+@contextlib.contextmanager
+def open_private_atomic_binary(path: Pathish) -> Iterator[IO[bytes]]:
+    """Atomically replace *path* from a verified owner-only temporary file.
+
+    The destination is unchanged if writing, flushing, or closing fails. The
+    temporary file is created beside the destination so ``os.replace`` remains
+    atomic and never crosses filesystems.
+    """
+    path = Path(path).expanduser()
+    ensure_private_directory(path.parent)
+    st_before = _lstat(path)
+    _reject_symlink(path, st_before)
+    if st_before is not None and not stat.S_ISREG(st_before.st_mode):
+        raise OSError(errno.EINVAL, f"private file path is not a regular file: {path}")
+
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temp_path = Path(temp_name)
+    handle: IO[bytes] | None = None
+    try:
+        opened = os.fstat(fd)
+        try:
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+        except (AttributeError, NotImplementedError):
+            try:
+                os.chmod(temp_path, PRIVATE_FILE_MODE, follow_symlinks=False)
+            except (NotImplementedError, TypeError):
+                if os.name != "nt":
+                    raise
+        current = os.stat(temp_path, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise OSError(
+                errno.EAGAIN,
+                f"private temporary file changed while opening: {temp_path}",
+            )
+        _verify_mode(temp_path, PRIVATE_FILE_MODE)
+
+        handle = os.fdopen(fd, "w+b")
+        fd = -1
+        yield handle
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+
+        # Re-check the leaf immediately before publication. os.replace replaces
+        # a symlink rather than following it, but refusing is the clearer and
+        # consistent contract for operator-selected destinations.
+        st_current = _lstat(path)
+        _reject_symlink(path, st_current)
+        if st_current is not None and not stat.S_ISREG(st_current.st_mode):
+            raise OSError(
+                errno.EINVAL, f"private file path is not a regular file: {path}"
+            )
+        os.replace(temp_path, path)
+        _verify_mode(path, PRIVATE_FILE_MODE)
+    except BaseException:
+        if handle is not None:
+            with contextlib.suppress(OSError, ValueError):
+                handle.close()
+        elif fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
 def copy_private_file(src: Pathish, dst: Pathish) -> None:
     """Copy a regular non-symlink file to a 0600 destination."""
     src = Path(src)
@@ -173,6 +270,9 @@ def copy_private_file(src: Pathish, dst: Pathish) -> None:
     _reject_symlink(src, st)
     if st is None or not stat.S_ISREG(st.st_mode):
         raise OSError(errno.EINVAL, f"snapshot source is not a regular file: {src}")
+
+    dst = Path(dst).expanduser()
+    _reject_symlink(dst)
 
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -221,15 +321,19 @@ def prepare_sqlite_path(path: Pathish, *, read_only: bool = False) -> str:
     a separate, explicit maintenance operation.
     """
     path = Path(path).expanduser()
-    st = _lstat(path)
-    _reject_symlink(path, st)
-    if st is not None:
-        if not stat.S_ISREG(st.st_mode):
-            raise OSError(errno.EINVAL, f"SQLite path is not a regular file: {path}")
-    elif read_only:
-        raise FileNotFoundError(path)
-    else:
+    if not read_only:
         ensure_private_directory(path.parent)
+
+    for _attempt in range(3):
+        st = _lstat(path)
+        _reject_symlink(path, st)
+        if st is not None:
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(errno.EINVAL, f"SQLite path is not a regular file: {path}")
+            return sqlite_file_uri(path, mode="ro" if read_only else "rw")
+        if read_only:
+            raise FileNotFoundError(path)
+
         flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
@@ -238,9 +342,9 @@ def prepare_sqlite_path(path: Pathish, *, read_only: bool = False) -> str:
         try:
             fd = os.open(path, flags, PRIVATE_FILE_MODE)
         except FileExistsError:
-            # A concurrent creator won. Re-run validation instead of following
-            # whatever appeared at the path.
-            return prepare_sqlite_path(path, read_only=read_only)
+            # A concurrent creator won. Retry validation a bounded number of
+            # times instead of recursing indefinitely under a hostile race.
+            continue
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 raise OSError(
@@ -248,15 +352,26 @@ def prepare_sqlite_path(path: Pathish, *, read_only: bool = False) -> str:
                 ) from exc
             raise
         try:
+            opened = os.fstat(fd)
             try:
                 os.fchmod(fd, PRIVATE_FILE_MODE)
             except (AttributeError, NotImplementedError):
                 pass
+            current = os.stat(path, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                raise OSError(
+                    errno.EAGAIN, f"SQLite path changed while creating: {path}"
+                )
+            _verify_mode(path, PRIVATE_FILE_MODE)
         finally:
             os.close(fd)
-        _verify_mode(path, PRIVATE_FILE_MODE)
+        return sqlite_file_uri(path, mode="rw")
 
-    return sqlite_file_uri(path, mode="ro" if read_only else "rw")
+    raise OSError(
+        errno.EAGAIN,
+        f"SQLite path kept changing during private creation: {path}",
+        str(path),
+    )
 
 
 def connect_private_sqlite(
