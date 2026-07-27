@@ -110,9 +110,15 @@ def test_security_dependency_floors_cover_declarations_lock_and_lazy_installs():
 
     floors = {
         "cryptography": Version("48.0.1"),
+        "httplib2": Version("0.32.0"),
         "mcp": Version("1.28.1"),
         "pillow": Version("12.3.0"),
+        "pyasn1": Version("0.6.4"),
+        "pydantic-settings": Version("2.14.2"),
+        "pygments": Version("2.20.0"),
+        "pytest": Version("9.0.3"),
         "python-multipart": Version("0.0.32"),
+        "setuptools": Version("83.0.0"),
         "starlette": Version("1.3.1"),
         "websocket-client": Version("1.9.0"),
     }
@@ -136,7 +142,15 @@ def test_security_dependency_floors_cover_declarations_lock_and_lazy_installs():
         locked_versions.setdefault(name, set()).add(Version(package["version"]))
 
     declared_required = set(floors) - {"websocket-client"}
-    lazy_required = {"mcp", "pillow", "python-multipart", "starlette"}
+    lazy_required = {
+        "httplib2",
+        "mcp",
+        "pillow",
+        "pyasn1",
+        "pydantic-settings",
+        "python-multipart",
+        "starlette",
+    }
     assert declared_required <= project_pins.keys()
     assert lazy_required <= lazy_pins.keys()
 

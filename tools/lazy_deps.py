@@ -212,6 +212,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "google-api-python-client==2.194.0",
         "google-auth-oauthlib==1.3.1",
         "google-auth-httplib2==0.3.1",
+        "httplib2==0.32.0",
+        "pyasn1==0.6.4",
     ),
     "skill.youtube": ("youtube-transcript-api==1.2.4",),
 
@@ -239,6 +241,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "tool.computer_use": (
         "mcp==1.28.1",
         "starlette==1.3.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
+        "pydantic-settings==2.14.2",  # GHSA-4xgf-cpjx-pc3j
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
     #
