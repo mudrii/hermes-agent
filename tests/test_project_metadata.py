@@ -3,12 +3,17 @@
 from pathlib import Path
 import tomllib
 
+from packaging.version import Version
 
-def _load_optional_dependencies():
+
+def _load_pyproject():
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject_path.open("rb") as handle:
-        project = tomllib.load(handle)["project"]
-    return project["optional-dependencies"]
+        return tomllib.load(handle)
+
+
+def _load_optional_dependencies():
+    return _load_pyproject()["project"]["optional-dependencies"]
 
 
 def test_matrix_extra_not_in_all():
@@ -92,6 +97,59 @@ def _exact_pins(specs):
         package = package.split("[", 1)[0].lower().replace("_", "-")
         pins[package] = version
     return pins
+
+
+def test_security_dependency_floors_cover_declarations_lock_and_lazy_installs():
+    """Known-fixed floors must survive every installation surface.
+
+    Project declarations, the resolver lock, and lazy feature installs are
+    independent persistence layers. A fix on only one layer can be silently
+    downgraded by ``hermes update`` or first feature use.
+    """
+    from tools.lazy_deps import LAZY_DEPS
+
+    floors = {
+        "cryptography": Version("48.0.1"),
+        "mcp": Version("1.28.1"),
+        "pillow": Version("12.3.0"),
+        "python-multipart": Version("0.0.32"),
+        "starlette": Version("1.3.1"),
+        "websocket-client": Version("1.9.0"),
+    }
+    project = _load_pyproject()["project"]
+    project_specs = list(project["dependencies"])
+    for specs in project["optional-dependencies"].values():
+        project_specs.extend(specs)
+    project_pins = _exact_pins(project_specs)
+
+    lazy_specs = []
+    for specs in LAZY_DEPS.values():
+        lazy_specs.extend((specs,) if isinstance(specs, str) else specs)
+    lazy_pins = _exact_pins(lazy_specs)
+
+    lock_path = Path(__file__).resolve().parents[1] / "uv.lock"
+    with lock_path.open("rb") as handle:
+        lock = tomllib.load(handle)
+    locked_versions: dict[str, set[Version]] = {}
+    for package in lock["package"]:
+        name = package["name"].lower().replace("_", "-")
+        locked_versions.setdefault(name, set()).add(Version(package["version"]))
+
+    declared_required = set(floors) - {"websocket-client"}
+    lazy_required = {"mcp", "pillow", "python-multipart", "starlette"}
+    assert declared_required <= project_pins.keys()
+    assert lazy_required <= lazy_pins.keys()
+
+    for package, floor in floors.items():
+        assert package in locked_versions, f"{package} must be present in uv.lock"
+        assert min(locked_versions[package]) >= floor, (
+            f"uv.lock resolves {package} below security floor {floor}: "
+            f"{sorted(locked_versions[package])}"
+        )
+        if package in project_pins:
+            assert Version(project_pins[package]) >= floor
+        if package in lazy_pins:
+            assert Version(lazy_pins[package]) >= floor
 
 
 def test_pyproject_aiohttp_pins_match_lazy_slack_pin():
