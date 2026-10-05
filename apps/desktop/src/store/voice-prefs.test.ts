@@ -20,13 +20,21 @@ import {
   applyVoiceStopPhraseFromConfig
 } from './voice-prefs'
 
+// Browser Storage is an exotic object: spying on an instance can silently
+// leave prototype methods active. The Node fallback has own methods instead.
+function storageWriteTarget(): Storage {
+  const prototype: Storage | null = Object.getPrototypeOf(localStorage)
+
+  return typeof prototype?.setItem === 'function' ? prototype : localStorage
+}
+
 it('keeps the desktop toggle local across config refreshes', async () => {
   for (const fails of [false, true]) {
     for (const enabled of [false, true]) {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(storageWriteTarget(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -55,7 +63,7 @@ it('migrates the legacy preference once, not on every refresh', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(storageWriteTarget(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
