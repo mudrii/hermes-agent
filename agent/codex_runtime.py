@@ -1006,29 +1006,164 @@ class _CodexResponseAssembler:
         handler = self._EXACT_HANDLERS.get(event_type) or next((h for m, h in self._FUZZY_HANDLERS if m(event_type)), None)
         return bool(handler(self, event, event_type)) if handler is not None else False
 
+    @staticmethod
+    def _has_empty_arguments(item: Any) -> bool:
+        """True for a ``function_call`` item whose arguments string is empty / "{}"."""
+        if getattr(item, "type", "") != "function_call":
+            return False
+        raw = getattr(item, "arguments", None)
+        if not isinstance(raw, str):
+            return False
+        return raw.strip() in ("", "{}")
+
+    @staticmethod
+    def _call_identity(item: Any) -> tuple[str, str]:
+        """Stable identity tuple (name, call_id) for a ``function_call`` item.
+
+        ``call_id`` may be the wire id (``fc_…``), the pairing id, or
+        ``"<call_id>|<response_item_id>"``; the first half is the
+        effective pairing key Hermes uses for tool results.
+        """
+        name = str(getattr(item, "name", "") or "")
+        raw_id = getattr(item, "call_id", None) or getattr(item, "id", "") or ""
+        if not isinstance(raw_id, str):
+            raw_id = ""
+        call_id = raw_id.split("|", 1)[0].strip()
+        return name, call_id
+
+    def _drop_duplicate_empty_calls(self, items: list) -> list:
+        """Drop empty-args ``function_call`` items whose identity is already
+        used by a non-empty call in the same turn.
+
+        Some Copilot/MAI models emit a no-op ``function_call`` alongside a
+        real one (live evidence: ``mai-code-1.1-flash`` with two
+        ``read_file`` items, the second with ``arguments=""`` and a
+        duplicate ``call_id``). The empty-args item would dispatch a
+        default-path tool with no chance of recovery. We do NOT drop a
+        legitimate zero-arg tool (``list_tools``) when it is the ONLY call
+        in the turn — that would silently eat a real tool use. See
+        tests/agent/test_copilot_empty_args_function_call.py.
+        """
+        # First pass: collect the (name, call_id) of every non-empty
+        # ``function_call`` so a later empty-args twin can be detected.
+        live_identities: set[tuple[str, str]] = set()
+        for item in items:
+            if getattr(item, "type", "") != "function_call":
+                continue
+            if self._has_empty_arguments(item):
+                continue
+            identity = self._call_identity(item)
+            if identity[1]:  # need a real call_id to qualify as a duplicate
+                live_identities.add(identity)
+        kept: list = []
+        for item in items:
+            if getattr(item, "type", "") != "function_call":
+                kept.append(item)
+                continue
+            if not self._has_empty_arguments(item):
+                kept.append(item)
+                continue
+            identity = self._call_identity(item)
+            if identity in live_identities:
+                continue  # duplicate of a real call — drop
+            kept.append(item)
+        return kept
+
+    @staticmethod
+    def _drop_indexed_duplicate_empty_calls(
+        indexed: list[tuple[Any, int, Any]],
+    ) -> list[tuple[Any, int, Any]]:
+        """Drop empty-args ``function_call`` entries whose identity is
+        already used by a non-empty call — applied to the full
+        ``(output_index, sequence, item)`` tuples, not to the items
+        alone. The shared metadata is what keeps a survivor from
+        inheriting the dropped item's ``output_index`` / sequence in
+        the assembly step. Distinct IDs, distinct names, nonempty
+        duplicates, and lone zero-arg calls all pass through
+        untouched. See tests/agent/test_copilot_empty_args_function_call.py
+        and tests/agent/test_codex_responses_settle_pending_tool_calls.py.
+        """
+        # First pass: collect the (name, call_id) of every non-empty
+        # function_call so a later empty-args twin can be detected.
+        live_identities: set[tuple[str, str]] = set()
+        for _output_index, _sequence, item in indexed:
+            if getattr(item, "type", "") != "function_call":
+                continue
+            if _CodexResponseAssembler._has_empty_arguments(item):
+                continue
+            identity = _CodexResponseAssembler._call_identity(item)
+            if identity[1]:  # need a real call_id to qualify as a duplicate
+                live_identities.add(identity)
+        kept: list[tuple[Any, int, Any]] = []
+        for entry in indexed:
+            _output_index, _sequence, item = entry
+            if getattr(item, "type", "") != "function_call":
+                kept.append(entry)
+                continue
+            if not _CodexResponseAssembler._has_empty_arguments(item):
+                kept.append(entry)
+                continue
+            identity = _CodexResponseAssembler._call_identity(item)
+            if identity in live_identities:
+                continue  # duplicate of a real call — drop
+            kept.append(entry)
+        return kept
+
     def _settled_output(self) -> List[Any]:
-        """Merge .done items with settled pending calls, keeping stream order."""
-        indexed = list(zip(self.output_indexes, self.output_sequences, self.output_items))
+        """Merge .done items with settled pending calls, keeping stream order.
+
+        Empty-args twins of a real call already in ``output_items`` are
+        dropped (see ``_drop_duplicate_empty_calls``). Critically, the
+        filter is applied to the full ``(output_index, sequence, item)``
+        tuples so dropping an item cannot leak its (index, sequence)
+        onto the next survivor — zips are always 1:1 with their
+        originating item. A pending empty-args call with no real twin
+        still survives with the canonical ``{}`` arguments — the
+        existing zero-arg tool contract.
+        """
+        # Zip the original output items with their (output_index, sequence)
+        # FIRST, then drop empty-args twins of a non-empty call from the
+        # joined tuples. Filtering the items list alone and re-zipping
+        # against the original indexes/sequences would misalign the
+        # alignment: a dropped item's index would be inherited by the
+        # next survivor, and any pending call sorted by output_index
+        # would jump into the gap the dropped item left.
+        output_indexed: list[tuple[Any, int, Any]] = list(
+            zip(self.output_indexes, self.output_sequences, self.output_items)
+        )
+        output_indexed = self._drop_indexed_duplicate_empty_calls(output_indexed)
+        # ``output_items`` is the canonical post-filter list; pending
+        # function calls whose call_id matches one already in
+        # ``output_items`` are duplicates of a real call and must not be
+        # re-settled.
+        live_identities = {
+            self._call_identity(item) for _, _, item in output_indexed
+            if getattr(item, "type", "") == "function_call"
+        }
         for pending in self.pending_function_calls.values():
             item = pending["item"]
-            indexed.append((pending.get("output_index"), pending["sequence"], SimpleNamespace(
+            # Empty/whitespace arguments become "{}" so zero-delta calls stay executable; malformed
+            # non-empty JSON passes through untouched.
+            arguments = (pending["arguments"] or "").strip() or "{}"
+            identity = self._call_identity(item)
+            if arguments == "{}" and identity in live_identities:
+                continue
+            output_indexed.append((pending.get("output_index"), pending["sequence"], SimpleNamespace(
                 type="function_call", id=_event_field(item, "id", None), call_id=_event_field(item, "call_id", None),
                 name=_event_field(item, "name", None), status="completed",
-                # Empty/whitespace arguments become "{}" so zero-delta calls stay executable; malformed
-                # non-empty JSON passes through untouched.
-                arguments=(pending["arguments"] or "").strip() or "{}",
+                arguments=arguments,
             )))
         # output_index is optional: protocol order only when every entry has one, else wire order.
-        if all(entry[0] is not None for entry in indexed):
+        if all(entry[0] is not None for entry in output_indexed):
             with suppress(TypeError):  # non-comparable index values: keep wire order
-                indexed.sort(key=lambda entry: entry[0])
+                output_indexed.sort(key=lambda entry: entry[0])
         else:
-            indexed.sort(key=lambda entry: entry[1])
-        return [entry[2] for entry in indexed]
+            output_indexed.sort(key=lambda entry: entry[1])
+        return [entry[2] for entry in output_indexed]
 
     def result(self) -> SimpleNamespace:
         # With only plain text deltas (no tool calls), synthesize one message item.
-        output: List[Any] = list(self.output_items)
+        output: List[Any] = self._drop_duplicate_empty_calls(list(self.output_items))
         if not output and self.text_deltas and not self.has_tool_calls:
             content = [SimpleNamespace(type="output_text", text="".join(self.text_deltas))]
             output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]

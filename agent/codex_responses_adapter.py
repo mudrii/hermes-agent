@@ -1074,6 +1074,68 @@ def _response_tool_call(item: Any, item_type: str, index: int) -> SimpleNamespac
     )
 
 
+def _has_empty_call_arguments(arguments: Any) -> bool:
+    """True when a ``function_call`` carries no real argument payload.
+
+    Some Copilot/MAI models emit a no-op ``function_call`` alongside a real
+    one (or replay a call_id with no argument stream). Empty arguments would
+    dispatch a tool with no parameters — Hermes cannot tell a real zero-arg
+    call from a model glitch, so we drop the empty-args items at the
+    Responses adapter boundary before they reach the agent. See
+    tests/agent/test_copilot_empty_args_function_call.py.
+    """
+    if not isinstance(arguments, str):
+        return False
+    return arguments.strip() in ("", "{}")
+
+
+def _response_tool_call_identity(item: Any) -> tuple[str, str]:
+    """Stable identity tuple ``(name, call_id)`` for a Responses
+    ``function_call`` item — whether the raw wire item (with ``.name`` /
+    ``.call_id``) or a normalized chat-style tool call (with
+    ``.function.name`` / ``.id``/``.call_id``). ``call_id`` may be the
+    wire id (``fc_…``) or ``"<call_id>|<response_item_id>"``; the first
+    half is the effective pairing key Hermes uses for tool results."""
+    name = getattr(item, "name", None)
+    if not name:
+        function = getattr(item, "function", None)
+        name = getattr(function, "name", "") if function is not None else ""
+    name = str(name or "")
+    raw_id = (
+        getattr(item, "call_id", None)
+        or getattr(item, "id", None)
+        or ""
+    )
+    if not isinstance(raw_id, str):
+        raw_id = ""
+    call_id = raw_id.split("|", 1)[0].strip()
+    return name, call_id
+
+
+def _live_non_empty_function_call_identities(
+    output: List[Any],
+) -> set[tuple[str, str]]:
+    """Authoritative (name, call_id) identities of every non-empty,
+    non-incomplete ``function_call`` present in the raw Responses output
+    list. Computed once before normalization so the empty-args twin of
+    a real call is detected and dropped during the scan, not after the
+    fact via order-sensitive comparison on already-normalized objects.
+    See tests/agent/test_copilot_empty_args_function_call.py."""
+    live: set[tuple[str, str]] = set()
+    for item in output:
+        if getattr(item, "type", "") != "function_call":
+            continue
+        item_status = _lower_or_none(getattr(item, "status", None))
+        if item_status in _INCOMPLETE_STATUSES:
+            continue
+        if _has_empty_call_arguments(getattr(item, "arguments", "{}")):
+            continue
+        identity = _response_tool_call_identity(item)
+        if identity[1]:
+            live.add(identity)
+    return live
+
+
 def _capture_encrypted_item(
     item: Any, item_type: str, issuer_kind: Optional[str], issuer_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
@@ -1113,6 +1175,15 @@ class _OutputScan:
         self.saw_commentary_phase = self.saw_final_answer_phase = self.saw_reasoning_item = False
 
     def scan(self, output: List[Any], issuer_kind: Optional[str], issuer_model: Optional[str] = None) -> None:
+        # Precompute the set of authoritative, non-empty function_call
+        # identities from the RAW output before any normalization, so an
+        # empty-args twin of a real call can be detected against the
+        # original (name, call_id) — not against the already-normalized
+        # chat-style tool_calls list, which carries ``.function.name``
+        # rather than ``.name`` (and so would be invisible to a
+        # ``getattr(item, "name", "")`` lookup). See
+        # tests/agent/test_copilot_empty_args_function_call.py.
+        live_identities = _live_non_empty_function_call_identities(output)
         for item in output:
             item_type = getattr(item, "type", None)
             item_status = _lower_or_none(getattr(item, "status", None))
@@ -1137,6 +1208,18 @@ class _OutputScan:
                             "Native Responses compaction item captured (%d chars encrypted).", len(raw_item["encrypted_content"]),
                         )
             elif item_type == "custom_tool_call" or (item_type == "function_call" and item_status not in _INCOMPLETE_STATUSES):
+                # Drop empty-args ``function_call`` items whose identity is
+                # already used by a non-empty call in this turn. See
+                # _has_empty_call_arguments and
+                # tests/agent/test_copilot_empty_args_function_call.py.
+                # A lone zero-arg call (e.g. ``list_tools``) is preserved
+                # with the canonical ``{}`` arguments.
+                if item_type == "function_call":
+                    raw_arguments = getattr(item, "arguments", "{}")
+                    if _has_empty_call_arguments(raw_arguments):
+                        identity = _response_tool_call_identity(item)
+                        if identity in live_identities:
+                            continue
                 self.tool_calls.append(_response_tool_call(item, item_type, len(self.tool_calls)))
 
     def _message(self, item: Any, item_status: Optional[str]) -> None:

@@ -397,3 +397,133 @@ def test_announced_non_function_item_precedes_pending_call():
     assert types == ["message", "function_call"], (
         f"announced message lost its leading position: {types}"
     )
+
+
+def test_ghost_empty_duplicate_then_pending_settles_in_output_index_order():
+    """Regression: an empty-args ghost that arrives AND is .done before the
+    real ``read_file`` must not corrupt the output_index / sequence alignment
+    of the surviving items when the empty ghost is later dropped as a
+    duplicate.
+
+    The synthetic SSE (parent-provided) replays a Copilot/MAI-style stream
+    where ``response.output_item.added``/``done`` for the empty-args ghost
+    lands FIRST (output_index=2) — i.e. the empty-args item is announced and
+    closed before the valid ``read_file`` (output_index=0) — and a separate
+    pending call at output_index=1 receives only argument deltas and is
+    settled on ``response.completed``.
+
+    Order the user expects: ``[read_file, pending_tool]`` (output_index
+    ascending). The buggy candidate drops the ghost AFTER
+    ``output_items`` has been zipped with the original ``output_indexes``,
+    so the surviving read_file inherits the ghost's output_index=2 and the
+    pending call at output_index=1 sorts first — order inverts to
+    ``[pending_tool, read_file]``. Fix the assembly: filter the
+    (output_index, sequence, item) tuples together so dropping the ghost
+    cannot leak its index onto the survivor.
+    """
+    shared_call_id = "call_oU3D1tyIbFZznZXKeekrQ8ft"
+    valid_args = (
+        '{"limit": 3, "offset": 1, '
+        '"path": "/Users/mudrii/.hermes/hermes-agent/README.md"}'
+    )
+    pending_args = '{"k": 1}'
+    events = [
+        SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_1")),
+        # Ghost: empty-args, announced AND done FIRST at output_index=2.
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=2,
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_ghost",
+                call_id=shared_call_id,
+                name="read_file",
+                arguments="",
+            ),
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            output_index=2,
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_ghost",
+                call_id=shared_call_id,
+                name="read_file",
+                arguments="",
+            ),
+        ),
+        # Valid read_file at output_index=0, announced + done second.
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=0,
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_real",
+                call_id=shared_call_id,
+                name="read_file",
+                arguments="",
+            ),
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id="fc_real",
+            output_index=0,
+            delta=valid_args,
+        ),
+        SimpleNamespace(
+            type="response.output_item.done",
+            output_index=0,
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_real",
+                call_id=shared_call_id,
+                name="read_file",
+                arguments=valid_args,
+            ),
+        ),
+        # Pending call at output_index=1: announced + deltas, never .done.
+        SimpleNamespace(
+            type="response.output_item.added",
+            output_index=1,
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_pending",
+                call_id="call_pending",
+                name="pending_tool",
+                arguments="",
+            ),
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id="fc_pending",
+            output_index=1,
+            delta=pending_args,
+        ),
+        # response.completed settles the pending call (no .done for fc_pending).
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(id="resp_1", status="completed", output=None),
+        ),
+    ]
+    final = _consume_codex_event_stream(events, model="gpt-test")
+
+    calls = [
+        item
+        for item in final.output
+        if getattr(item, "type", "") == "function_call"
+    ]
+    # Order is authoritative: output_index ascending. read_file=0, pending=1.
+    names = [getattr(call, "name", None) for call in calls]
+    assert names == ["read_file", "pending_tool"], (
+        f"empty-args ghost leaked its output_index onto the surviving read_file; "
+        f"expected ['read_file', 'pending_tool'], got {names}"
+    )
+    # Surviving read_file must carry the real arguments, not the empty-args
+    # ghost's "" (which would dispatch read_file with no path).
+    surviving_read_file = calls[0]
+    assert getattr(surviving_read_file, "arguments", "") == valid_args, (
+        f"surviving read_file lost its real arguments, got "
+        f"{getattr(surviving_read_file, 'arguments', '')!r}"
+    )
+    assert getattr(calls[1], "name", None) == "pending_tool"
+    assert getattr(calls[1], "arguments", None) == pending_args
