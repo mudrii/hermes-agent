@@ -9,6 +9,8 @@ uninstall drops the record.
 """
 
 import shutil
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -178,7 +180,19 @@ def test_failed_swap_keeps_the_previous_bundle_launchable(rebuilt, tmp_path, mon
 @pytest.mark.platforms("macos")
 def test_recorded_app_that_went_missing_comes_back_until_gui_uninstall(rebuilt, tmp_path, monkeypatch):
     from hermes_cli import gui_uninstall
-    from hermes_cli import main as hermes_main
+    # ``hermes_cli.main`` triggers the entry-point bootstrap (``import hermes_bootstrap``)
+    # which probes ``<project_root>/../manifest.json`` via ``pm.environments.payload_venv``.
+    # This worktree is itself nested under the operator's live home
+    # (``~/.hermes/cache/scratch/.../worktree-updater-test``), so the boot-time
+    # ``is_file()`` would land on a real-home path and trip the test-environment
+    # ``HomeIOGuard``. The only attribute the test needs from ``hermes_cli.main`` is
+    # ``PROJECT_ROOT`` (consumed by ``main_desktop._owns_installed_desktop_apps`` and
+    # patched below); inject a stub so the import side effects never run. The
+    # stub participates in ``from hermes_cli.main import PROJECT_ROOT`` because
+    # ``from X import Y`` resolves ``X`` through ``sys.modules``.
+    hermes_main = types.ModuleType("hermes_cli.main")
+    hermes_main.PROJECT_ROOT = Path("<not-set>")  # type: ignore[attr-defined]
+    sys.modules.setdefault("hermes_cli.main", hermes_main)
 
     home = tmp_path / "hermes-home"
     (home / "hermes-agent").mkdir(parents=True)
