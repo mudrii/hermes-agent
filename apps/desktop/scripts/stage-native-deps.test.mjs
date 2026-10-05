@@ -73,7 +73,10 @@ test('a missing Linux HUD toolchain leaves no empty package directories', () => 
     const distDir = join(tmp, 'dist')
     assert.equal(buildHudModifierMonitor({ source: join(tmp, 'missing-source'), distDir, platform: 'linux', arch: 'x64' }), null)
     assert.equal(existsSync(join(distDir, 'native')), false)
-    assert.match(warnings.join('\n'), /desktop packaging continues/)
+    const expectedWarning = process.platform === 'linux' && process.arch === 'x64'
+      ? /desktop packaging continues/
+      : /modifier tap unavailable for this target/
+    assert.match(warnings.join('\n'), expectedWarning)
   } finally {
     console.warn = originalWarn
     fs.rmSync(tmp, { recursive: true, force: true })

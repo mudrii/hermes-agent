@@ -2501,6 +2501,12 @@ def copilot_model_api_mode(
     if catalog is None and api_key:  # fetch once so normalize + endpoint check share it
         catalog = fetch_github_model_catalog(api_key=api_key)
     normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
+    for entry in catalog or []:
+        if entry.get("id") == normalized:
+            endpoints = entry.get("supported_endpoints") or []
+            if "/responses" in endpoints and "/chat/completions" not in endpoints:
+                return "codex_responses"
+            break
     if normalized and _should_use_copilot_responses_api(normalized):
         return "codex_responses"
     return "chat_completions"
