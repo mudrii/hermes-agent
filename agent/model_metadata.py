@@ -322,8 +322,9 @@ DEFAULT_CONTEXT_LENGTHS = {
     # 1M verified on OpenRouter & Nous portal 2026-08; qwen3-max = 256K Coding Plan snapshot)
     "qwen3.8-max": 1_000_000, "qwen3.8-flash": 1_000_000, "qwen3.6-plus": 1048576, "qwen3.7-plus": 1048576,
     "qwen3-coder-plus": 1000000, "qwen3-coder": 262144, "qwen3-max": 262144, "qwen": 131072,
-    # MiniMax — M3 is 1M; M2.x is 204,800. https://platform.minimax.io/docs/api-reference/text-chat-openai
-    "minimax-m3": 1000000, "minimax": 204800,
+    # MiniMax — M3 is 1M; M3.1-Flash-Preview is 1M (M Plan / Token Plan, 2026-09-27);
+    # M2.x is 204,800. https://platform.minimax.io/docs/api-reference/text-chat-openai
+    "minimax-m3.1-flash-preview": 1000000, "minimax-m3": 1000000, "minimax": 204800,
     # GLM — Nous + OpenRouter /v1/models (2026-09-09): 5.3 / 5.3-flash 1,310,720 (:batch/:US 1,048,576);
     # 5.3-flashx 1,048,576 (2026-09-20; its own key, else the shorter 5.3-flash entry wins by substring);
     # 5.2 1,048,576; 5 / 5.1 / 4.7 / 4.6 204,800; *-turbo / 4.7-flash 202,752 (the catch-all).
