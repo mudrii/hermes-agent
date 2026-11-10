@@ -58,6 +58,7 @@ dependencies = [
   # Declared where clib ships a cp314 wheel; elsewhere hermes_yaml falls back to pure.
   "ruamel.yaml.clib==0.2.15; python_version >= '3.14' and platform_python_implementation == 'CPython' and (sys_platform == 'darwin' or (sys_platform == 'linux' and platform_machine in 'x86_64 aarch64 i686') or (sys_platform == 'win32' and platform_machine in 'AMD64 x86'))",
   "requests==2.34.2; python_version >= '3.14'",  # CVE-2026-25645
+  "oauthlib==4.0.1; python_version >= '3.14'",  # GHSA-3jp2-3mrg-2vxc (v0.23.1 locks 4.0.0)
   "jinja2==3.1.6; python_version >= '3.14'",
   # Document-to-Markdown extraction for read_file (PDF, legacy Office,
   # OpenDocument, RTF, EPUB) + typed NeedsOcrError for scanned pages.
