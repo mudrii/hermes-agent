@@ -34,7 +34,7 @@ _READS = frozenset({
     "is_kanban_owned_session", "list_sessions_rich", "search_sessions", "get_next_title_in_lineage",
     "get_handoff_state", "get_meta", "get_compression_tip", "resolve_session_by_title", "get_messages",
     "session_count", "sanitize_title", "session_yolo_enabled",
-    "get_session_model_config_value",
+    "get_session_model_config_value", "prompt_refresh_epoch",
 })
 # Writes the gateway already performs itself (persistence, accounting, maintenance).
 _GATEWAY_OWNED = frozenset({
@@ -566,6 +566,9 @@ class SurfaceLabelReader:
 
     def get_session_model_config_value(self, session_id, key, default=None):
         return self.persistence.sessions.get_model_config_value(session_id, key, default)
+
+    def prompt_refresh_epoch(self, session_id):
+        return self.persistence.sessions.prompt_refresh_epoch(session_id)
 
     def get_meta(self, key):
         return self.persistence.state_meta.get(key)

@@ -19,3 +19,19 @@ def test_cli_session_store_is_the_gateway_store_and_opens_no_writer(monkeypatch)
     HermesCLI._init_session_store(cli)
     assert isinstance(cli._session_db, GatewaySessionStore) and not cli._session_db_unavailable
     assert constructed == []
+
+
+def test_prompt_refresh_epoch_uses_the_gateway_stores_read_only_reader(caplog):
+    from agent.prompt_refresh import requested_epoch
+    from hermes_cli.gateway_session_store import GatewaySessionStore
+    from persistence_assembly import open_persistence, profile_scope
+
+    viewer = GatewaySessionStore(SimpleNamespace(final=False))
+    agent = SimpleNamespace(_session_db=viewer, session_id="viewer-session")
+    with open_persistence(profile_scope(), eager=True) as writer:
+        epoch = writer.sessions.request_prompt_refresh()
+        try:
+            assert requested_epoch(agent) == epoch
+            assert "Prompt refresh epoch read failed" not in caplog.text
+        finally:
+            viewer.close_reader()
